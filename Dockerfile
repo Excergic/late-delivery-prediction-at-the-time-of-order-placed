@@ -2,6 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# libgomp1 is required by LightGBM (OpenMP runtime) — missing from slim base image
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (layer cached unless requirements change)
 COPY api/requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
