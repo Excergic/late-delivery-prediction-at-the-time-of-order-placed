@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# ZenML local state
+.zenml/
+
+# MLflow
+mlruns/
+
+# Data — too large for git (180K rows)
+data/
+
+# Pipeline outputs
+outputs/
+
+# Environment
+.env
