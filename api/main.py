@@ -6,6 +6,7 @@ applies the same feature engineering as training, and returns
 a late delivery risk score and flag.
 
 Endpoints:
+    GET  /                — project overview and available endpoints
     GET  /health          — liveness check
     POST /predict         — score a single order
     POST /predict/batch   — score up to 1000 orders
@@ -167,6 +168,27 @@ def _make_result(prob: float, pred: int) -> PredictionResult:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@app.get("/", tags=["System"])
+def root():
+    """Project overview and available endpoints."""
+    return {
+        "title": "Supply Chain Late Delivery Prediction",
+        "description": (
+            "Predicts which shipments are at risk of arriving late at the time of order placement. "
+            "Built with LightGBM + scikit-learn, trained on 125K historical supply chain orders."
+        ),
+        "version": "1.0.0",
+        "endpoints": {
+            "GET  /": "Project overview (this response)",
+            "GET  /health": "Liveness check — confirms the model is loaded and ready",
+            "POST /predict": "Score a single order for late delivery risk",
+            "POST /predict/batch": "Score up to 1000 orders in one request",
+            "GET  /docs": "Interactive Swagger UI",
+            "GET  /redoc": "ReDoc API documentation",
+        },
+    }
+
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 def health():
