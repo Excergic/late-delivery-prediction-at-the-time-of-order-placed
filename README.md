@@ -43,7 +43,7 @@ Think of it like a doctor diagnosing a patient: they can only use symptoms visib
 
 The system is built in three layers: a trained AI model, a backend API, and a user-facing web app.
 
-![Supply Chain Late-Delivery Risk — MLOps Architecture (Data to Deployment)](<asset/Screenshot 2026-05-21 at 12.07.51 PM.png>)
+![Late Delivery Prediction at Order Placed — MLOps Architecture (Logistics Domain)](<asset/final archiitecture.png>)
 
 ### Layer 1 — The ML Model
 
