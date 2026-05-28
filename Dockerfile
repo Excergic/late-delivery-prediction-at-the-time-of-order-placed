@@ -20,6 +20,12 @@ COPY configs/      configs/
 RUN useradd -m appuser && chown -R appuser /app
 USER appuser
 
+# Runtime security configuration:
+#   API_KEY=<key>              — required in production; auth via Authorization: Bearer
+#   FRONTEND_ORIGIN=<origin>   — CORS allowlist (default: Vercel frontend URL)
+#   RATE_LIMIT_MAX=<int>       — max POST requests per IP per window (default: 60)
+#   RATE_LIMIT_WINDOW=<int>    — rate limit window in seconds (default: 60)
+# For local dev, leave API_KEY unset to disable auth.
 EXPOSE 8000
 
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -5,9 +5,16 @@ Wraps the trained LightGBM pipeline. Accepts raw order data,
 applies the same feature engineering as training, and returns
 a late delivery risk score and flag.
 
+Security:
+    - API key authentication via Authorization: Bearer <key>
+      (set API_KEY env var; leave unset to disable for local dev)
+    - CORS restricted to frontend origin (FRONTEND_ORIGIN env var)
+    - Rate limiting on /predict and /predict/batch (60 req/min per IP)
+    - /health endpoint is public (for monitoring probes)
+
 Endpoints:
     GET  /                — project overview and available endpoints
-    GET  /health          — liveness check
+    GET  /health          — liveness check (no auth required)
     POST /predict         — score a single order
     POST /predict/batch   — score up to 1000 orders
 """
@@ -15,15 +22,19 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import time
 import yaml
 import joblib
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.responses import JSONResponse
 
 from api.schemas import (
     OrderInput, PredictionResult,
@@ -32,15 +43,92 @@ from api.schemas import (
 )
 
 # ---------------------------------------------------------------------------
-# Config & model paths — resolved relative to this file so they work both
-# locally (python -m uvicorn) and inside a Docker container.
+# Security configuration
+# ---------------------------------------------------------------------------
+
+# API key. Set via env var in production. When unset, auth is disabled
+# for local development.
+API_KEY = os.environ.get("API_KEY", "")
+
+# Frontend origin for CORS. Override for local development:
+#   export FRONTEND_ORIGIN="http://localhost:3000"
+FRONTEND_ORIGIN = os.environ.get(
+    "FRONTEND_ORIGIN",
+    "https://late-delivey-prediction.vercel.app",
+)
+
+# Rate limiting: max POST requests per IP per window on prediction endpoints
+RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "60"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))  # seconds
+
+# ---------------------------------------------------------------------------
+# Auth dependency — applies to /predict and /predict/batch
+# ---------------------------------------------------------------------------
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def verify_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> None:
+    """
+    Dependency that protects prediction endpoints.
+
+    If API_KEY is set, the request must include a valid
+    Authorization: Bearer <key> header. If unset, all requests pass
+    through (local development mode).
+    """
+    if not API_KEY:
+        return
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Authorization header. Use: Bearer <API_KEY>",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if credentials.credentials != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — in-memory sliding window per client IP
+# ---------------------------------------------------------------------------
+
+_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+
+
+async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path in ("/predict", "/predict/batch") and request.method == "POST":
+        ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        cutoff = now - RATE_LIMIT_WINDOW
+
+        timestamps = _rate_limit_store[ip]
+        _rate_limit_store[ip] = [t for t in timestamps if t > cutoff]
+
+        if len(_rate_limit_store[ip]) >= RATE_LIMIT_MAX:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Try again later."},
+            )
+
+        _rate_limit_store[ip].append(now)
+
+    return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# Config & model paths
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).parent.parent
 MODEL_PATH = BASE_DIR / "model" / "pipeline.pkl"
 CONFIG_PATH = BASE_DIR / "configs" / "training_config.yaml"
 
-# Loaded once at startup
 _pipeline = None
 _config = None
 _threshold = None
@@ -62,7 +150,7 @@ async def lifespan(app: FastAPI):
     print(f"Model loaded from {MODEL_PATH}")
     print(f"Decision threshold: {_threshold}")
 
-    yield  # app is running
+    yield
 
     _pipeline = None
 
@@ -78,35 +166,32 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.middleware("http")(rate_limit_middleware)
+
+# CORS — restrict to the frontend domain only
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_ORIGIN],
+    allow_credentials=True,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
 # ---------------------------------------------------------------------------
-# Feature engineering — identical logic to training (core/preprocessing.py)
-# Duplicated here so the API has zero dependency on the training codebase.
+# Feature engineering — identical to training (core/preprocessing.py)
 # ---------------------------------------------------------------------------
 
 def _order_to_dataframe(order: OrderInput) -> pd.DataFrame:
-    """
-    Convert a single OrderInput into a one-row DataFrame with the exact
-    column names and date-derived features the trained pipeline expects.
-    """
-    # Parse date
     date = pd.to_datetime(order.order_date, errors="coerce")
     if pd.isna(date):
         raise HTTPException(
             status_code=422,
             detail=f"Cannot parse order_date: '{order.order_date}'. "
-                   "Use ISO format (2018-01-15) or M/D/YYYY HH:MM."
+                   "Use ISO format (2018-01-15) or M/D/YYYY HH:MM.",
         )
 
     row = {
-        # Numeric features
         "Days for shipment (scheduled)": order.days_for_shipment_scheduled,
         "Order Item Discount":           order.order_item_discount,
         "Order Item Discount Rate":      order.order_item_discount_rate,
@@ -119,12 +204,10 @@ def _order_to_dataframe(order: OrderInput) -> pd.DataFrame:
         "Product Price":                 order.product_price,
         "Latitude":                      order.latitude,
         "Longitude":                     order.longitude,
-        # Date-derived numeric features
         "order_month":        float(date.month),
         "order_day_of_week":  float(date.dayofweek),
         "order_is_weekend":   float(int(date.dayofweek >= 5)),
         "order_quarter":      float(date.quarter),
-        # Categorical features
         "Shipping Mode":      order.shipping_mode,
         "Type":               order.payment_type,
         "Customer Segment":   order.customer_segment,
@@ -137,10 +220,6 @@ def _order_to_dataframe(order: OrderInput) -> pd.DataFrame:
 
 
 def _predict_dataframe(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Apply the frozen sklearn Pipeline to a feature DataFrame.
-    Returns (probabilities, binary_predictions).
-    """
     preprocessor = _pipeline.named_steps["preprocessor"]
     model = _pipeline.named_steps["model"]
 
@@ -171,7 +250,6 @@ def _make_result(prob: float, pred: int) -> PredictionResult:
 
 @app.get("/", tags=["System"])
 def root():
-    """Project overview and available endpoints."""
     return {
         "title": "Supply Chain Late Delivery Prediction",
         "description": (
@@ -182,8 +260,8 @@ def root():
         "endpoints": {
             "GET  /": "Project overview (this response)",
             "GET  /health": "Liveness check — confirms the model is loaded and ready",
-            "POST /predict": "Score a single order for late delivery risk",
-            "POST /predict/batch": "Score up to 1000 orders in one request",
+            "POST /predict": "Score a single order for late delivery risk (auth required)",
+            "POST /predict/batch": "Score up to 1000 orders in one request (auth required)",
             "GET  /docs": "Interactive Swagger UI",
             "GET  /redoc": "ReDoc API documentation",
         },
@@ -192,7 +270,6 @@ def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 def health():
-    """Liveness check. Returns 200 when the model is loaded and ready."""
     return HealthResponse(
         status="ok",
         model_loaded=_pipeline is not None,
@@ -201,14 +278,7 @@ def health():
 
 
 @app.post("/predict", response_model=PredictionResult, tags=["Prediction"])
-def predict(order: OrderInput):
-    """
-    Score a single order and return its late delivery risk.
-
-    Accepts raw order fields (same data available at order placement time —
-    no delivery outcome columns). Applies the same feature engineering as
-    the training pipeline before scoring.
-    """
+def predict(order: OrderInput, auth: None = Depends(verify_api_key)):
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
@@ -218,13 +288,7 @@ def predict(order: OrderInput):
 
 
 @app.post("/predict/batch", response_model=BatchResult, tags=["Prediction"])
-def predict_batch(body: BatchInput):
-    """
-    Score up to 1000 orders in a single request.
-
-    Returns predictions in the same order as the input list,
-    plus summary statistics (flag count, flag rate).
-    """
+def predict_batch(body: BatchInput, auth: None = Depends(verify_api_key)):
     if _pipeline is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 

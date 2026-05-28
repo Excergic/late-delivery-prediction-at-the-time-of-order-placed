@@ -43,7 +43,7 @@ export async function fetchHealth(): Promise<HealthResponse> {
 }
 
 export async function predict(order: OrderInput): Promise<PredictionResult> {
-  const res = await fetch(`${API_BASE}/predict`, {
+  const res = await fetch("/api/predict", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(order),
